@@ -112,6 +112,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         await self.initialize()
         await self.addEndpoint(1, 0x0104, 0x0005, [0x0020, 0x0500], [0x0020, 0x0500])
         await self.addEndpoint(13, 0xC05E, 0x0840, [0x1000, ], [0x1000, ])
+        await self.addEndpoint(242, 0xA1E0, 0x0061, [0x0021, ], [0x0021, ])
         v = await e.networkInit(queue=False)
         if v[0] != t.EmberStatus.SUCCESS:
             if not auto_form:
@@ -203,7 +204,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         e = self._ezsp
         v = await e.setPolicy(
             t.EzspPolicyId.TC_KEY_REQUEST_POLICY,
-            t.EzspDecisionId.DENY_TC_KEY_REQUESTS,
+            t.EzspDecisionId.GENERATE_NEW_TC_LINK_KEY,
             queue=False
         )
         assert v[0] == t.EmberStatus.SUCCESS  # TODO: Better check
