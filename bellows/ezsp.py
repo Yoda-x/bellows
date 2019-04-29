@@ -47,6 +47,7 @@ class EZSP:
         if result[0] != version:
             LOGGER.debug("Switching to eszp version %d", result[0])
             await self._command('version', result[0], queue=False)
+        return result[2]
 
     def Run_enable(self):
         self._gw.Run_enable()

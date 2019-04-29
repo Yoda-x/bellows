@@ -19,7 +19,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     def __init__(self, ezsp, database_file=None):
         super().__init__(database_file=database_file)
-        self._ezsp = ezsp 
+        self._ezsp = ezsp
 
         self._pending = dict()
         self._multicast_table = dict()
@@ -32,6 +32,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self._startup_task = None
         self._watchdog_task = asyncio.ensure_future(self._watchdog())
         self._pull_frames_task = None
+        self._stackversion = 0x50000 # mimimum stackversion
 
     def status(self):
         return [self._ezsp.status(), [
@@ -69,7 +70,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         await asyncio.sleep(1)
 
         await e.reset()
-        await e.version()
+        self._stackversion = await e.version()
+        LOGGER.info("EZSP StackVersion : 0x%04x", self._stackversion)
         self._pull_frames_task = asyncio.ensure_future(self._pull_frames())
         c = t.EzspConfigId
         await self._cfg(c.CONFIG_STACK_PROFILE, 2)
@@ -81,13 +83,19 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         )
         await self._cfg(c.CONFIG_APPLICATION_ZDO_FLAGS, zdo)
         await self._cfg(c.CONFIG_TRUST_CENTER_ADDRESS_CACHE_SIZE, 2)
-        await self._cfg(c.CONFIG_ADDRESS_TABLE_SIZE, 32)
+        await self._cfg(c.CONFIG_ADDRESS_TABLE_SIZE, 64)
         await self._cfg(c.CONFIG_SOURCE_ROUTE_TABLE_SIZE, 16)
         await self._cfg(c.CONFIG_MAX_END_DEVICE_CHILDREN, 16)
-        await self._cfg(c.CONFIG_KEY_TABLE_SIZE, 1)
+        await self._cfg(c.CONFIG_KEY_TABLE_SIZE, 16)
         await self._cfg(c.CONFIG_TRANSIENT_KEY_TIMEOUT_S, 180, True)
-        await self._cfg(c.CONFIG_END_DEVICE_POLL_TIMEOUT, 60)
-        await self._cfg(c.CONFIG_END_DEVICE_POLL_TIMEOUT_SHIFT, 6)
+        if self._stackversion > 0x64ff:
+            await self._cfg(c.CONFIG_END_DEVICE_POLL_TIMEOUT, 9)
+            # with ezsp_callback_handlerstack 6.5 timeout changes
+            # timeout_shift is gone
+            # The timeout corresponding to a nonzero value N is 2^N minutes
+        else:
+            await self._cfg(c.CONFIG_END_DEVICE_POLL_TIMEOUT, 120)
+            await self._cfg(c.CONFIG_END_DEVICE_POLL_TIMEOUT_SHIFT, 8)
         await self._cfg(c.CONFIG_APS_UNICAST_MESSAGE_COUNT, 20)
         await self._cfg(c.CONFIG_PACKET_BUFFER_COUNT, 0xff)
         self._route_table_size = await self._get(c.CONFIG_ROUTE_TABLE_SIZE)
@@ -104,6 +112,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         await self.initialize()
         await self.addEndpoint(1, 0x0104, 0x0005, [0x0020, 0x0500], [0x0020, 0x0500])
         await self.addEndpoint(13, 0xC05E, 0x0840, [0x1000, ], [0x1000, ])
+        await self.addEndpoint(242, 0xA1E0, 0x0061, [0x0021, ], [0x0021, ])
         v = await e.networkInit(queue=False)
         if v[0] != t.EmberStatus.SUCCESS:
             if not auto_form:
@@ -135,7 +144,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             await self.subscribe_group(group_id)
 
     async def addEndpoint(self, endpoint, profile, deviceid, input_cluster,
-            output_cluster):
+                          output_cluster):
         e = self._ezsp
         result = await e.addEndpoint(
                        endpoint,
@@ -162,7 +171,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         initial_security_state = bellows.zigbee.util.zha_security(
                 controller=True)
         v = await self._ezsp.setInitialSecurityState(initial_security_state,
-                queue=False)
+                                                     queue=False)
         assert v[0] == t.EmberStatus.SUCCESS  # TODO: Better check
 
         parameters = t.EmberNetworkParameters()
@@ -195,7 +204,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         e = self._ezsp
         v = await e.setPolicy(
             t.EzspPolicyId.TC_KEY_REQUEST_POLICY,
-            t.EzspDecisionId.DENY_TC_KEY_REQUESTS,
+            t.EzspDecisionId.GENERATE_NEW_TC_LINK_KEY,
             queue=False
         )
         assert v[0] == t.EmberStatus.SUCCESS  # TODO: Better check
@@ -260,7 +269,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 for e in exep_data:
                     LOGGER.debug("> %s", e)
 
-    def _handle_frame(self, message_type, aps_frame, lqi, rssi, sender, binding_index, address_index, message):
+    def _handle_frame(self, message_type, aps_frame, lqi, rssi, sender, 
+            binding_index, address_index, message):
+        if message_type in (t.EmberIncomingMessageType.INCOMING_MULTICAST_LOOPBACK, 
+                            t.EmberIncomingMessageType.INCOMING_BROADCAST_LOOPBACK):
+            LOGGER.debug("drop received broadcast/multicast from self")
+            return
         try:
             device = self.get_device(nwk=sender)
         except KeyError:
@@ -269,17 +283,24 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
         device.radio_details(lqi, rssi)
         try:
-            tsn, command_id, is_reply, args = self.deserialize(device, aps_frame.sourceEndpoint, aps_frame.clusterId, message)
+            tsn, command_id, is_reply, args = self.deserialize(
+                    device, aps_frame.sourceEndpoint, aps_frame.clusterId, 
+                    message)
         except ValueError as e:
-            LOGGER.error("Failed to parse message (%s) on cluster %d, because %s", binascii.hexlify(message), aps_frame.clusterId, e)
+            LOGGER.error("Failed to parse message (%s) on cluster %d, because %s",
+                    binascii.hexlify(message), aps_frame.clusterId, e)
             return
 
         if is_reply:
-            self._handle_reply(device, aps_frame, tsn, command_id, args)
+            self._handle_reply(device, aps_frame, tsn, command_id, args, 
+                    message_type=message_type)
         else:
-            self.handle_message(device, False, aps_frame.profileId, aps_frame.clusterId, aps_frame.sourceEndpoint, aps_frame.destinationEndpoint, tsn, command_id, args)
+            self.handle_message(device, False, aps_frame.profileId, 
+                    aps_frame.clusterId, aps_frame.sourceEndpoint, 
+                    aps_frame.destinationEndpoint, tsn, command_id, args, 
+                    message_type=message_type)
 
-    def _handle_reply(self, sender, aps_frame, tsn, command_id, args):
+    def _handle_reply(self, sender, aps_frame, tsn, command_id, args, **kwargs):
         try:
             send_fut, reply_fut = self._pending[tsn]
             if send_fut.done():
@@ -289,14 +310,17 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             return
         except KeyError:
             LOGGER.debug("0x%04x:%s:0x%04x Unexpected response TSN=%s command=%s args=%s ",
-                           sender.nwk, aps_frame.sourceEndpoint, aps_frame.clusterId,
-                           tsn, command_id, args)
+                         sender.nwk, aps_frame.sourceEndpoint, aps_frame.clusterId,
+                         tsn, command_id, args)
         except asyncio.futures.InvalidStateError as exc:
             LOGGER.debug("Invalid state on future - probably duplicate response: %s", exc)
             # We've already handled, don't drop through to device handler
             return
 
-        self.handle_message(sender, True, aps_frame.profileId, aps_frame.clusterId, aps_frame.sourceEndpoint, aps_frame.destinationEndpoint, tsn, command_id, args)
+        self.handle_message(sender, True, aps_frame.profileId,
+                aps_frame.clusterId, aps_frame.sourceEndpoint,
+                aps_frame.destinationEndpoint, tsn, command_id, args,
+                **kwargs)
 
     def _handle_frame_failure(self, message_type, destination, aps_frame, message_tag, status, message):
         try:
@@ -329,11 +353,60 @@ class ControllerApplication(zigpy.application.ControllerApplication):
     def _handle_incomingRouteErrorHandler(self, status, nwkid):
         LOGGER.debug("Route Record ERROR:%s:%s", status, nwkid)
 
-    @zigpy.util.retryable_request
     async def request(self, nwk, profile, cluster, src_ep, dst_ep, sequence,
-            data, expect_reply=True, timeout=15):
+                      data, expect_reply=True, timeout=15, request_type='unicast'):
+        if request_type == 'unicast':
+            v = await self.urequest(nwk, profile, cluster, src_ep, dst_ep,
+                                    sequence, data, expect_reply=expect_reply,
+                                    timeout=timeout)
+        elif request_type == 'multicast':
+            v = 0
+            await self.mrequest(nwk, profile, cluster, src_ep, dst_ep, sequence,
+                                data, expect_reply=False, timeout=timeout)
+        return v
+
+    async def mrequest(self, nwk, profile, cluster, src_ep, dst_ep, sequence,
+                       data, expect_reply=False, timeout=2):
+        send_fut = asyncio.Future()
+        reply_fut = None
+        self._pending[sequence] = (send_fut, reply_fut)
+
+        aps_frame = t.EmberApsFrame()
+        aps_frame.profileId = t.uint16_t(profile)
+        aps_frame.clusterId = t.uint16_t(cluster)
+        aps_frame.sourceEndpoint = t.uint8_t(src_ep)
+        aps_frame.destinationEndpoint = t.uint8_t(dst_ep)
+        aps_frame.options = t.EmberApsOption(t.EmberApsOption.APS_OPTION_NONE)
+        aps_frame.groupId = t.uint16_t(nwk)
+        aps_frame.sequence = t.uint8_t(sequence)
+        LOGGER.debug(
+            "sendMultiCast to GROUP:0x%04x DST_EP:%s PROFIL_ID:%s CLUSTER:0x%04x TSN:%s, Timeout:%s",
+            nwk, dst_ep, profile,  cluster, sequence, timeout,
+            )
+        try:
+            v = await asyncio.wait_for(
+                self._ezsp.sendMulticast(aps_frame, 0, 3,  sequence, data),
+                timeout)
+        except asyncio.TimeoutError:
+            LOGGER.error(
+                "Multicast uart timeout GROUP:0x%04x DST_EP:%s PROFIL_ID:%s CLUSTER:0x%04x TSN:%s, Timeout:%s",
+                nwk, dst_ep, profile,  cluster, sequence, timeout,
+            )
+            self._pending.pop(sequence)
+            send_fut.cancel()
+        if v[0] != t.EmberStatus.SUCCESS:
+            self._pending.pop(sequence)
+            send_fut.cancel()
+            LOGGER.error("Multicast send failure GROUP:0x%04x DST_EP:%s PROFIL_ID:%s CLUSTER:0x%04x TSN:%s, Timeout:%s",
+                         nwk, dst_ep, profile,  cluster, sequence,  timeout,
+                         )
+        return v
+
+    @zigpy.util.retryable_request
+    async def urequest(self, nwk, profile, cluster, src_ep, dst_ep, sequence,
+                       data, expect_reply=True, timeout=15):
 #        LOGGER.debug("pending message queue length: %s", len(self._pending))
-        assert sequence not in self._pending
+
         send_fut = asyncio.Future()
         reply_fut = None
         if expect_reply:
@@ -357,7 +430,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             )
         try:
             v = await asyncio.wait_for(self._ezsp.sendUnicast(self.direct,
-                nwk, aps_frame, sequence, data), timeout)
+                                       nwk, aps_frame, sequence, data), timeout)
         except asyncio.TimeoutError:
             LOGGER.debug(
                 "sendunicast uart timeout NWKID:0x%04x DST_EP:%s PROFIL_ID:%s CLUSTER:0x%04x TSN:%s, Timeout:%s",
@@ -374,19 +447,20 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             if expect_reply:
                 reply_fut.cancel()
             LOGGER.debug("sendunicast send failure NWKID:0x%04x DST_EP:%s PROFIL_ID:%s CLUSTER:0x%04x TSN:%s, Timeout:%s",
-                    nwk, dst_ep, profile,  cluster, sequence, timeout,
-            )
+                         nwk, dst_ep, profile,  cluster, sequence, timeout,
+                         )
             raise DeliveryError("Message send failure _send_unicast_fail")
         try:
             v = await asyncio.wait_for(send_fut, timeout)
         except DeliveryError as e:
-            LOGGER.debug("0x%04x:%s:0x%04x sendunicast send_ACK failure - Error:%s", nwk, dst_ep, cluster, e)
+            LOGGER.debug("0x%04x:%s:0x%04x sendunicast send_ACK failure - Error:%s",
+                         nwk, dst_ep, cluster, e)
             raise
         except asyncio.TimeoutError:
             LOGGER.debug("sendunicast message send_ACK timeout NWKID:0x%04x DST_EP:%s PROFIL_ID:%s CLUSTER:0x%04x TSN:%s, Timeout:%s",
-                    nwk, dst_ep, profile,  cluster, sequence, timeout,
-            )
-            
+                         nwk, dst_ep, profile,  cluster, sequence, timeout,
+                         )
+
             self._pending.pop(sequence)
             if expect_reply:
                 reply_fut.cancel()
