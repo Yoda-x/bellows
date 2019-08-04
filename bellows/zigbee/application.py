@@ -309,6 +309,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 reply_fut.set_result(args)
             return
         except KeyError:
+
             LOGGER.debug("[0x%04x:%s:0x%04x] Unexpected response TSN=%s command=%s args=%s ",
                          sender.nwk, aps_frame.sourceEndpoint, aps_frame.clusterId,
                          tsn, command_id, args)
@@ -452,6 +453,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             send_fut.cancel()
             if expect_reply:
                 reply_fut.cancel()
+
             LOGGER.debug("[0x%04x:%s:0x%04x] sendunicast send failure: PROFIL_ID:%s, TSN:%s, Timeout:%s",
                          nwk, dst_ep, cluster, profile, sequence, timeout)
             raise DeliveryError("Message send failure _send_unicast_fail")
