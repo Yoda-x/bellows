@@ -309,11 +309,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 reply_fut.set_result(args)
             return
         except KeyError:
-            LOGGER.debug("0x%04x:%s:0x%04x Unexpected response TSN=%s command=%s args=%s ",
+            LOGGER.debug("[0x%04x:%s:0x%04x] Unexpected response TSN=%s command=%s args=%s ",
                          sender.nwk, aps_frame.sourceEndpoint, aps_frame.clusterId,
                          tsn, command_id, args)
         except asyncio.futures.InvalidStateError as exc:
-            LOGGER.debug("Invalid state on future - probably duplicate response: %s", exc)
+            LOGGER.debug("[0x%04x:%s:0x%04x] Invalid state on future - probably duplicate response: %s",
+            sender.nwk, aps_frame.sourceEndpoint, aps_frame.clusterId, exc)
             # We've already handled, don't drop through to device handler
             return
 
@@ -330,9 +331,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             if reply_fut:
                 reply_fut.cancel()
         except KeyError:
-            LOGGER.debug("Unexpected message send failure _frame_failure")
+            LOGGER.debug("[0x%04x:%s:0x%04x] Unexpected message send failure _frame_failure", 
+                    destination.nwk, aps_frame.sourceEndpoint, aps_frame.clusterId)
         except asyncio.futures.InvalidStateError as exc:
-            LOGGER.debug("Invalid state on future - probably duplicate response: %s", exc)
+            LOGGER.debug("Invalid state on future - probably duplicate response: %s", 
+                    destination.nwk, aps_frame.sourceEndpoint, aps_frame.clusterId,
+                    exc)
 
     def _handle_frame_sent(self, message_type, destination, aps_frame, message_tag, status, message):
         try:
@@ -343,9 +347,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 self._pending.pop(message_tag)
             send_fut.set_result(status)
         except KeyError:
-            LOGGER.debug("Unexpected message send notification")
+            LOGGER.debug("[0x%04x:%s:0x%04x] Unexpected message send notification", 
+                    destination, aps_frame.destinationEndpoint, aps_frame.clusterId)
         except asyncio.futures.InvalidStateError as exc:
-            LOGGER.debug("Invalid state on future - probably duplicate response: %s", exc)
+            LOGGER.debug("[0x%04x:%s:0x%04x] Invalid state on future - probably duplicate response: %s",
+                    destination, aps_frame.destinationEndpoint, aps_frame.clusterId,
+                    exc)
 
     def _handle_route_record(self, *args):
         LOGGER.debug("Route Record:%s", args)
@@ -405,7 +412,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
     @zigpy.util.retryable_request
     async def urequest(self, nwk, profile, cluster, src_ep, dst_ep, sequence,
                        data, expect_reply=True, timeout=15):
-#        LOGGER.debug("pending message queue length: %s", len(self._pending))
+        LOGGER.debug("pending message queue length: %s", len(self._pending))
 
         send_fut = asyncio.Future()
         reply_fut = None
@@ -425,17 +432,16 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         aps_frame.groupId = t.uint16_t(0)
         aps_frame.sequence = t.uint8_t(sequence)
         LOGGER.debug(
-            "sendUnicast to NWKID:0x%04x DST_EP:%s PROFIL_ID:%s CLUSTER:0x%04x TSN:%s, Timeout:%s",
-            nwk, dst_ep, profile,  cluster, sequence, timeout,
+            "[0x%04x:%s:0x%04x] sendUnicast  on PROFIL_ID:%s TSN:%s, Timeout:%s",
+            nwk, dst_ep, cluster, profile, sequence, timeout,
             )
         try:
             v = await asyncio.wait_for(self._ezsp.sendUnicast(self.direct,
                                        nwk, aps_frame, sequence, data), timeout)
         except asyncio.TimeoutError:
             LOGGER.debug(
-                "sendunicast uart timeout NWKID:0x%04x DST_EP:%s PROFIL_ID:%s CLUSTER:0x%04x TSN:%s, Timeout:%s",
-                nwk, dst_ep, profile,  cluster, sequence, timeout,
-            )
+                "[0x%04x:%s:0x%04x] sendunicast uart timeout on PROFIL_ID:%s TSN:%s, Timeout:%s",
+                nwk, dst_ep, cluster, profile, sequence, timeout)
             self._pending.pop(sequence)
             send_fut.cancel()
             if expect_reply:
@@ -446,31 +452,22 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             send_fut.cancel()
             if expect_reply:
                 reply_fut.cancel()
-            LOGGER.debug("sendunicast send failure NWKID:0x%04x DST_EP:%s PROFIL_ID:%s CLUSTER:0x%04x TSN:%s, Timeout:%s",
-                         nwk, dst_ep, profile,  cluster, sequence, timeout,
-                         )
+            LOGGER.debug("[0x%04x:%s:0x%04x] sendunicast send failure: PROFIL_ID:%s, TSN:%s, Timeout:%s",
+                         nwk, dst_ep, cluster, profile, sequence, timeout)
             raise DeliveryError("Message send failure _send_unicast_fail")
         try:
             v = await asyncio.wait_for(send_fut, timeout)
         except DeliveryError as e:
-            LOGGER.debug("0x%04x:%s:0x%04x sendunicast send_ACK failure - Error:%s",
+            LOGGER.debug("[0x%04x:%s:0x%04x] sendunicast send_ACK failure - Error:%s",
                          nwk, dst_ep, cluster, e)
             raise
         except asyncio.TimeoutError:
-            LOGGER.debug("sendunicast message send_ACK timeout NWKID:0x%04x DST_EP:%s PROFIL_ID:%s CLUSTER:0x%04x TSN:%s, Timeout:%s",
-                         nwk, dst_ep, profile,  cluster, sequence, timeout,
-                         )
-
+            LOGGER.debug("[0x%04x:%s:0x%04x] sendunicast message send_ACK timeout PROFIL_ID:%s TSN:%s, Timeout:%s",
+                         nwk, dst_ep, cluster, profile, sequence, timeout)
             self._pending.pop(sequence)
             if expect_reply:
                 reply_fut.cancel()
-            raise DeliveryError("ACK_TIMEOUT")
- #       if v != t.EmberStatus.SUCCESS:
- #           self._pending.pop(sequence)
- #           if expect_reply:
- #               reply_fut.cancel()
- #           LOGGER.debug("sendunicast send_ACK failure 0x%04x:%s:0x%04x = %s", nwk, dst_ep, cluster, v)
- #           raise DeliveryError("sendunicast send_ACK failure")
+            raise DeliveryError("SEND_ACK_TIMEOUT")
         if expect_reply:
             try:
                 v = await asyncio.wait_for(reply_fut, timeout)
